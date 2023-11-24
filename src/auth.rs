@@ -7,11 +7,12 @@ use pbkdf2::{
     Pbkdf2,
 };
 use rand_core::{OsRng, RngCore};
-use tracing::info;
+use sqlx::error::ErrorKind;
+use tracing::{info, error};
 
 use crate::{
     errors::{LoginError, SignupError},
-    Database, Random, USER_COOKIE_NAME,
+    Database, Random, USER_COOKIE_NAME, users::PermissionLevel,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +45,7 @@ impl SessionToken {
 #[derive(Clone)]
 pub(crate) struct User {
     pub username: String,
+    pub permission_level: PermissionLevel,
 }
 
 #[derive(Clone)]
@@ -54,20 +56,28 @@ impl AuthState {
         self.0.is_some()
     }
 
+    pub async fn is_admin(&mut self) -> bool {
+        if let Some(user) = self.get_user().await {
+            user.permission_level == PermissionLevel::Admin
+        } else {
+            false
+        }
+    }
+
     pub async fn get_user(&mut self) -> Option<&User> {
         let (session_token, store, database) = self.0.as_mut()?;
         if store.is_none() {
             const QUERY: &str =
-                "SELECT id, username FROM users JOIN sessions ON user_id = id WHERE session_token = $1;";
+                "SELECT id, username, permission_level FROM users JOIN sessions ON user_id = id WHERE session_token = $1;";
 
-            let user: Option<(i32, String)> = sqlx::query_as(QUERY)
+            let user: Option<(i32, String, i32)> = sqlx::query_as(QUERY)
                 .bind(&session_token.into_database_value())
                 .fetch_optional(&*database)
                 .await
                 .unwrap();
 
-            if let Some((_id, username)) = user {
-                *store = Some(User { username });
+            if let Some((_id, username, permission_level)) = user {
+                *store = Some(User { username, permission_level: PermissionLevel::from(permission_level) });
             }
         }
         store.as_ref()
@@ -75,11 +85,11 @@ impl AuthState {
 }
 
 pub(crate) async fn new_session(database: &Database, random: Random, user_id: i32) -> SessionToken {
-    const QUERY: &str = "INSERT INTO sessions (session_token, user_id) VALUES ($1, $2);";
+    const INSERT_TOKEN_QUERY: &str = "INSERT INTO sessions (session_token, user_id) VALUES ($1, $2);";
 
     let session_token = SessionToken::generate_new(random);
 
-    let _result = sqlx::query(QUERY)
+    sqlx::query(INSERT_TOKEN_QUERY)
         .bind(&session_token.into_database_value())
         .bind(user_id)
         .execute(database)
@@ -109,8 +119,6 @@ pub(crate) async fn auth<B>(
         })
         .and_then(|cookie_value| cookie_value.parse::<SessionToken>().ok());
 
-    info!("session_token: {:?}", &session_token);
-
     req.extensions_mut()
         .insert(AuthState(session_token.map(|v| (v, None, database))));
 
@@ -134,18 +142,15 @@ pub(crate) async fn signup(
         return Err(SignupError::InvalidUsername);
     }
 
-    const INSERT_QUERY: &str =
+    const INSERT_USER_QUERY: &str =
         "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id;";
 
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = Pbkdf2.hash_password(password.as_bytes(), &salt);
-    let hashed_password = if let Ok(password) = password_hash {
-        password.to_string()
-    } else {
-        return Err(SignupError::InvalidPassword);
+    let hashed_password = match Pbkdf2.hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng)) {
+        Ok(password) => password.to_string(),
+        Err(_) => return Err(SignupError::InvalidPassword),
     };
 
-    let fetch_one = sqlx::query_as(INSERT_QUERY)
+    let fetch_one = sqlx::query_as(INSERT_USER_QUERY)
         .bind(username)
         .bind(hashed_password)
         .fetch_one(database)
@@ -154,11 +159,13 @@ pub(crate) async fn signup(
     let user_id: i32 = match fetch_one {
         Ok((user_id,)) => user_id,
         Err(sqlx::Error::Database(database))
-            if database.constraint() == Some("users_username_key") =>
+            if database.kind() == ErrorKind::UniqueViolation =>
         {
+            info!("Sign in error: Username already exists");
             return Err(SignupError::UsernameExists);
         }
-        Err(_err) => {
+        Err(e) => {
+            error!("Internal Error: {}", e);
             return Err(SignupError::InternalError);
         }
     };
@@ -169,13 +176,13 @@ pub(crate) async fn signup(
 pub(crate) async fn login(
     database: &Database,
     random: Random,
-    username: &str,
-    password: &str,
+    username: String,
+    password: String,
 ) -> Result<SessionToken, LoginError> {
     const LOGIN_QUERY: &str = "SELECT id, password FROM users WHERE users.username = $1;";
 
     let row: Option<(i32, String)> = sqlx::query_as(LOGIN_QUERY)
-        .bind(username)
+        .bind(&username)
         .fetch_optional(database)
         .await
         .unwrap();
@@ -183,11 +190,13 @@ pub(crate) async fn login(
     let (user_id, hashed_password) = if let Some(row) = row {
         row
     } else {
+        info!("User '{}' does not exist", username);
         return Err(LoginError::UserDoesNotExist);
     };
 
     let parsed_hash = PasswordHash::new(&hashed_password).unwrap();
     if let Err(_err) = Pbkdf2.verify_password(password.as_bytes(), &parsed_hash) {
+        info!("Password incorrect for user '{}'", username);
         return Err(LoginError::WrongPassword);
     }
 
@@ -201,9 +210,28 @@ pub(crate) async fn delete_user(auth_state: AuthState) {
         );";
 
     let auth_state = auth_state.0.unwrap();
-    let _res = sqlx::query(DELETE_QUERY)
+    sqlx::query(DELETE_QUERY)
         .bind(&auth_state.0.into_database_value())
         .execute(&auth_state.2)
         .await
         .unwrap();
+}
+
+pub(crate) async fn get_user(username: &str, database: &Database) -> Option<(String, Option<String>, i32)> {
+    const QUERY: &str =
+        "SELECT username, profile, permission_level FROM users WHERE username = $1;";
+
+    sqlx::query_as(QUERY)
+        .bind(username)
+        .fetch_optional(database)
+        .await
+        .unwrap()
+}
+
+pub(crate) async fn is_logged_in_user(auth_state: &mut AuthState, username: &str) -> bool {
+    auth_state
+        .get_user()
+        .await
+        .map(|logged_in_user| logged_in_user.username == username)
+        .unwrap_or_default()
 }

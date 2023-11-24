@@ -3,8 +3,15 @@
 {% block content %}
 <p>@{{ username }}</p>
 {% if is_self %}
-<form method="post" action="/delete">
-    <input type="submit" value="Delete account">
+<form action="/profile" method="post">
+    <textarea name="profile" rows="10" cols="30">{{profile}}</textarea>
+    <input type="submit" value="Edit profile">
 </form>
+<form method="post" action="/delete">
+    <input type="submit" value="Delete account" id="delete-account">
+</form>
+{% else %}
+<p>{{ profile }}</p> 
 {% endif %}
+
 {% endblock content %}

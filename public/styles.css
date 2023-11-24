@@ -45,3 +45,12 @@ input[type="submit"] {
     margin-top: 20px;
     font-size: 12pt;
 }
+
+#delete-account {
+    border: none;
+    margin-right: auto;
+    padding: 10px 22px;
+    margin-top: 20px;
+    margin-bottom: 20px;
+    font-size: 12pt;
+}

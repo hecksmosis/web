@@ -1,31 +1,31 @@
 mod auth;
 mod errors;
+mod users;
 mod utils;
 
-use axum_macros::debug_handler;
 use shuttle_runtime::CustomError;
 use std::sync::{Arc, Mutex};
+use users::{me, profile, user, users, admin, add_admin, remove_admin};
 
 use axum::{
-    extract::{Extension, Path},
+    extract::Extension,
     http::{self, Response},
     middleware,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse},
     routing::{any, get, post},
     Form, Router,
 };
 
 use auth::{auth, delete_user, login, signup, AuthState};
-use errors::{NoUser, NotLoggedIn, SignupError};
+use errors::{NotLoggedIn, SignupError};
 use pbkdf2::password_hash::rand_core::OsRng;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
 use shuttle_axum::ShuttleAxum;
-use sqlx::Executor;
+use sqlx::{Executor, PgPool};
 use tera::{Context, Tera};
 use utils::*;
 
-use sqlx::PgPool;
 type Templates = Arc<Tera>;
 type Database = sqlx::PgPool;
 type Random = Arc<Mutex<ChaCha8Rng>>;
@@ -46,6 +46,7 @@ pub fn get_router(database: Database) -> Router {
     let mut tera = Tera::default();
     tera.add_raw_templates(vec![
         ("base.html", include_str!("../templates/base.html")),
+        ("admin", include_str!("../templates/admin.html")),
         ("index", include_str!("../templates/index.html")),
         ("signup", include_str!("../templates/signup.html")),
         ("login", include_str!("../templates/login.html")),
@@ -65,7 +66,11 @@ pub fn get_router(database: Database) -> Router {
         .route("/delete", post(post_delete))
         .route("/me", get(me))
         .route("/user/:username", get(user))
+        .route("/profile", post(profile))
         .route("/users", get(users))
+        .route("/admin", get(admin))
+        .route("/admin/add/:username", post(add_admin))
+        .route("/admin/remove/:username", post(remove_admin))
         .route("/styles.css", any(styles))
         .layer(middleware::from_fn(move |req, next| {
             auth(req, next, middleware_database.clone())
@@ -83,35 +88,6 @@ async fn index(
     context.insert("logged_in", &current_user.logged_in());
     context.insert("home_screen", &true);
     Html(templates.render("index", &context).unwrap())
-}
-
-async fn user(
-    Path(username): Path<String>,
-    Extension(mut auth_state): Extension<AuthState>,
-    Extension(database): Extension<Database>,
-    Extension(templates): Extension<Templates>,
-) -> impl IntoResponse {
-    const QUERY: &str = "SELECT username FROM users WHERE username = $1;";
-
-    let user: Option<(String,)> = sqlx::query_as(QUERY)
-        .bind(&username)
-        .fetch_optional(&database)
-        .await
-        .unwrap();
-
-    if let Some((username,)) = user {
-        let user_is_self = auth_state
-            .get_user()
-            .await
-            .map(|logged_in_user| logged_in_user.username == username)
-            .unwrap_or_default();
-        let mut context = Context::new();
-        context.insert("username", &username);
-        context.insert("is_self", &user_is_self);
-        Ok(Html(templates.render("user", &context).unwrap()))
-    } else {
-        Err(error_page(&NoUser(username)))
-    }
 }
 
 async fn get_signup(Extension(templates): Extension<Templates>) -> impl IntoResponse {
@@ -135,19 +111,22 @@ async fn post_signup(
         return Err(error_page(&SignupError::PasswordsDoNotMatch));
     }
 
+    if password.len() < 8 {
+        return Err(error_page(&SignupError::InvalidPassword));
+    }
+
     match signup(&database, random, &username, &password).await {
         Ok(session_token) => Ok(login_response(session_token)),
         Err(error) => Err(error_page(&error)),
     }
 }
 
-#[debug_handler]
 async fn post_login(
     Extension(database): Extension<Database>,
     Extension(random): Extension<Random>,
     Form(LoginForm { username, password }): Form<LoginForm>,
 ) -> impl IntoResponse {
-    match login(&database, random, &username, &password).await {
+    match login(&database, random, username, password).await {
         Ok(session_token) => Ok(login_response(session_token)),
         Err(err) => Err(error_page(&err)),
     }
@@ -169,33 +148,6 @@ async fn styles() -> impl IntoResponse {
         .header("Content-Type", "text/css")
         .body(include_str!("../public/styles.css").to_owned())
         .unwrap()
-}
-
-async fn me(
-    Extension(mut current_user): Extension<AuthState>,
-) -> Result<impl IntoResponse, impl IntoResponse> {
-    if let Some(user) = current_user.get_user().await {
-        Ok(Redirect::to(&format!("/user/{}", user.username)))
-    } else {
-        Err(error_page(&NotLoggedIn))
-    }
-}
-
-async fn users(
-    Extension(database): Extension<Database>,
-    Extension(templates): Extension<Templates>,
-) -> impl IntoResponse {
-    const QUERY: &str = "SELECT username FROM users LIMIT 100;";
-
-    let users: Vec<(String,)> = sqlx::query_as(QUERY).fetch_all(&database).await.unwrap();
-
-    // This should be a no op right :)
-    let users = users.into_iter().map(|(value,)| value).collect::<Vec<_>>();
-
-    let mut context = Context::new();
-    context.insert("users", &users);
-
-    Html(templates.render("users", &context).unwrap())
 }
 
 #[derive(serde::Deserialize)]

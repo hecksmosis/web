@@ -15,12 +15,14 @@
 </p>
 {% endif %}
 <p>
-    <a href="https://www.shuttle.rs/blog/2022/08/11/authentication-tutorial">View full article</a>
-</p>
-<p>
-    <a href="https://github.com/kaleidawave/axum-shuttle-postgres-authentication-demo">View repository</a>
-</p>
-<p>
     <a href="/users">View all users</a>
 </p>
+{% if is_admin %}
+<p>
+    <a href="/admin">Admin</a>
+</p>
+{% endif %}
+<a href="https://github.com/hecksmosis">
+    <i class="fa fa-github" style="font-size: 36px; color: black;"></i>
+</a>
 {% endblock content %}

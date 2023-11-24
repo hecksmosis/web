@@ -1,10 +1,9 @@
-use crate::{auth::SessionToken, COOKIE_MAX_AGE, USER_COOKIE_NAME};
+use crate::{auth::SessionToken, COOKIE_MAX_AGE, USER_COOKIE_NAME, errors::ErrorInfo};
 use axum::{
     body::Empty,
     http::{Response, StatusCode},
     response::IntoResponse,
 };
-use std::error::Error;
 
 pub(crate) fn login_response(session_token: SessionToken) -> impl IntoResponse {
     Response::builder()
@@ -32,9 +31,9 @@ pub(crate) async fn logout_response() -> impl IntoResponse {
         .unwrap()
 }
 
-pub(crate) fn error_page(err: &dyn Error) -> impl IntoResponse {
+pub(crate) fn error_page(err: &dyn ErrorInfo) -> impl IntoResponse {
     Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(format!("Err: {}", err))
+        .status(err.error_info().0)
+        .body(err.error_info().1)
         .unwrap()
 }
